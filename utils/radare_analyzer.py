@@ -10,10 +10,10 @@ import json
 import sys
 
 
-class BinaryAnalyzer():
+class BinaryAnalyzer:
     def __init__(self, path):
         self.r2 = r2pipe.open(path, flags=["-2"])
-        self.r2.cmd("aaa")
+        self.r2.cmd("aa")
         self.arch = None
         self.bits = None
         try:
@@ -35,10 +35,10 @@ class BinaryAnalyzer():
         return hexasm
 
     def get_functions(self):
-        offsets = set()
+        fns = set()
         for f in self.afl:
-            offsets.add(f.get("offset", None))
-            for call in f.get("callrefs", []):
-                if call.get("type", None) == "CALL":
-                    offsets.add(call.get("addr", None))
-        return list(filter(None, offsets))
+            fns.add((f.get("name", None), f.get("addr", None)))
+            # for call in f.get("callrefs", []):
+            #     if call.get("type", None) == "CALL":
+            #         names.add(call.get("addr", None))
+        return list(fns)
