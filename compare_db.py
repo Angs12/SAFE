@@ -86,7 +86,7 @@ def compute_embeddings(safe, normalizer, instr):
     for fid, ids in tqdm(instr.items(), desc="Embeddings"):
         norm, lens = normalizer.normalize_functions([ids])
         with torch.no_grad():
-            embs[fid] = safe(torch.LongTensor(norm[0]).to(DEVICE), lens).detach().cpu()
+            embs[fid] = safe(torch.LongTensor(norm[0]).to(DEVICE), torch.LongTensor(lens)).detach().cpu()
     return embs
 
 

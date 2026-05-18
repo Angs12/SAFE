@@ -92,7 +92,7 @@ def embed_binary_store(binary_path, safe, converter, normalizer, db_path):
         converted_instructions = converter.convert_to_ids(instructions)
         instructions, length = normalizer.normalize_functions([converted_instructions])
         tensor = torch.LongTensor(instructions[0])
-        function_embedding = safe(tensor, length).detach()
+        function_embedding = safe(tensor, torch.LongTensor(length)).detach()
         store_embedding(conn, binary_path, fn, function_embedding)
     conn.close()
 

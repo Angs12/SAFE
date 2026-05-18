@@ -33,7 +33,7 @@ cnew = conn_new.cursor()
 def get_embedding(token_ids):
     norm, lens = normalizer.normalize_functions([token_ids])
     with torch.no_grad():
-        emb = safe(torch.LongTensor(norm[0]).to(DEVICE), lens).detach().cpu()
+        emb = safe(torch.LongTensor(norm[0]).to(DEVICE), torch.LongTensor(lens)).detach().cpu()
     return emb
 
 def get_tokens(cur, fid):
