@@ -5,6 +5,7 @@ For CPU efficiency, only the attention + dense layers are trained (embedding and
 """
 
 import sqlite3, json, os, sys, random, time
+import numpy as np
 import torch
 import torch.optim as optim
 
@@ -63,7 +64,7 @@ class PairDataset:
 def embed_batch(normalizer, safe, seqs):
     norm, lens = normalizer.normalize_functions(seqs)
     with torch.set_grad_enabled(True):
-        return safe(torch.LongTensor(norm).to(DEVICE), torch.LongTensor(lens).to(DEVICE))
+        return safe(torch.LongTensor(np.array(norm)).to(DEVICE), torch.LongTensor(lens).to(DEVICE))
 
 
 def main():
