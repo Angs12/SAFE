@@ -5,6 +5,13 @@ model/*
 __pycache__/
 *.py[cod]
 
+# sqlite3 database
+*.db
+
+# tar files
+*.tar
+*.tar.gz
+
 # C extensions
 *.so
 
