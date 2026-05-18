@@ -5,11 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from utils.function_normalizer import FunctionNormalizer
+from safetorch.parameters import Config
 
 
 class SAFE(nn.Module):
@@ -94,3 +97,18 @@ class SAFE(nn.Module):
             function_embedding = function_embedding.squeeze(0)
 
         return function_embedding
+
+    @classmethod
+    def load(cls, model_dir, device="cpu", train=False):
+        safe = cls(Config())
+        safe.load_state_dict(
+            torch.load(os.path.join(model_dir, "SAFEtorch.pt"), map_location=device)
+        )
+        safe = safe.to(device)
+        normalizer = FunctionNormalizer(150)
+        if train:
+            for name, param in safe.named_parameters():
+                if name.startswith("instructions_embeddings"):
+                    param.requires_grad = False
+            return safe.train(), normalizer
+        return safe.eval(), normalizer

@@ -23,13 +23,9 @@ class InstructionsConverter:
             if x in self.i2id:
                 ret_array.append(self.i2id[x] + 1)
             elif "X_" in x:
-                # print(str(x) + " is not a known x86 instruction")
                 ret_array.append(self.i2id["X_UNK"] + 1)
             elif "A_" in x:
-                # print(str(x) + " is not a known arm instruction")
                 ret_array.append(self.i2id["A_UNK"] + 1)
             else:
-                # print("There is a problem " + str(x) + " does not appear
-                # to be an asm or arm instruction")
                 ret_array.append(self.i2id["X_UNK"] + 1)
         return ret_array

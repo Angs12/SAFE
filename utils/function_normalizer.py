@@ -19,16 +19,6 @@ class FunctionNormalizer:
             f = np.pad(f, (0, self.max_instructions - f.shape[0]), mode="constant")
         return f, length
 
-    def normalize_function_pairs(self, pairs):
-        lengths = []
-        new_pairs = []
-        for x in pairs:
-            f0, len0 = self.normalize(x[0])
-            f1, len1 = self.normalize(x[1])
-            lengths.append((len0, len1))
-            new_pairs.append((f0, f1))
-        return new_pairs, lengths
-
     def normalize_functions(self, functions):
         lengths = []
         new_functions = []

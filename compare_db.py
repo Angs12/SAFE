@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare evaluation results between two databases using only common functions."""
 
-import sqlite3, json, os, sys, random
+import argparse, sqlite3, json, os, sys, random
 import numpy as np
 import torch
 import matplotlib
@@ -12,18 +12,9 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from safetorch.safe_network import SAFE
-from safetorch.parameters import Config
-from utils.function_normalizer import FunctionNormalizer
+from utils.db import load_instructions
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MAX_INSTRUCTIONS = 150
-
-
-def load_model(model_dir):
-    safe = SAFE(Config())
-    safe.load_state_dict(torch.load(
-        os.path.join(model_dir, "SAFEtorch.pt"), map_location=DEVICE))
-    return safe.to(DEVICE).eval(), FunctionNormalizer(MAX_INSTRUCTIONS)
 
 
 def get_intersection(db_paths):
@@ -38,11 +29,9 @@ def get_intersection(db_paths):
             keys[(row[0], row[1], row[2], row[3])] = row[4]
         all_keys.append(keys)
         conn.close()
-    # Find keys in ALL databases
     common = set(all_keys[0].keys())
     for k in all_keys[1:]:
         common &= set(k.keys())
-    # Build per-DB ID mappings for common keys
     mappings = [{k: d[k] for k in common} for d in all_keys]
     return mappings, list(common)
 
@@ -55,7 +44,6 @@ def filter_pairs(db_path, valid_ids):
     cur.execute("SELECT id1,id2,label FROM pairs")
     true_pairs = []
     false_pairs = []
-    batch = []
     for row in tqdm(cur, desc="Pairs"):
         if row[0] in valid_ids and row[1] in valid_ids:
             if row[2] == 1:
@@ -64,21 +52,6 @@ def filter_pairs(db_path, valid_ids):
                 false_pairs.append([row[0], row[1]])
     conn.close()
     return true_pairs, false_pairs
-
-
-def load_instructions(db_path, function_ids):
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    instr = {}
-    for i in range(0, len(function_ids), 900):
-        batch = function_ids[i:i + 900]
-        cur.execute(
-            f"SELECT id,instructions_list FROM filtered_functions "
-            f"WHERE id IN ({','.join('?' * len(batch))})", batch)
-        for row in cur.fetchall():
-            instr[row[0]] = json.loads(row[1])
-    conn.close()
-    return instr
 
 
 def compute_embeddings(safe, normalizer, instr):
@@ -159,21 +132,17 @@ def plot_comparison(results, labels, output_dir):
 
     for idx, (name, r) in enumerate(zip(labels, results)):
         c = colors[idx]
-        # Top-left: Metrics vs Threshold
         axes[0, 0].plot(r["acc_curve"][0], r["acc_curve"][1], c=c, ls="-", label=f"{name} Acc")
         axes[0, 0].plot(r["prec_curve"][0], r["prec_curve"][1], c=c, ls="--", label=f"{name} Prec")
         axes[0, 0].plot(r["f1_curve"][0], r["f1_curve"][1], c=c, ls=":", label=f"{name} F1")
         axes[0, 0].axvline(r["threshold"], c=c, alpha=0.3, ls="--")
 
-        # Top-right: ROC
         fpr, tpr = r["roc_curve"]
         axes[0, 1].plot(fpr, tpr, c=c, lw=2, label=f"{name} (AUC={r['roc_auc']:.4f})")
 
-        # Bottom-left: PR
         rc, pr = r["pr_curve"]
         axes[1, 0].plot(rc, pr, c=c, lw=2, label=f"{name} (AP={r['ap']:.4f})")
 
-        # Bottom-right: Score distribution
         axes[1, 1].hist(r["scores"][r["labels"] == 1], bins=80, alpha=0.4, density=True,
                         color=c, label=f"{name} pos")
         axes[1, 1].hist(r["scores"][r["labels"] == 0], bins=80, alpha=0.2, density=True,
@@ -204,45 +173,30 @@ def plot_comparison(results, labels, output_dir):
 
 
 def main():
-    args = sys.argv[1:]
-    if len(args) < 2:
-        print("Usage: compare_db.py <db1> <db2> [db3 ...] --model-dir <dir> --output <dir>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Compare evaluation results between databases")
+    parser.add_argument("db_paths", nargs="+", help="Database paths (at least 2)")
+    parser.add_argument("--model-dir", default=".", help="Model directory")
+    parser.add_argument("--output", default=".", help="Output directory")
+    args = parser.parse_args()
 
-    model_dir = "."
-    output_dir = "."
-    db_paths = []
-    i = 0
-    while i < len(args):
-        if args[i] == "--model-dir":
-            model_dir = args[i + 1]
-            i += 2
-        elif args[i] == "--output":
-            output_dir = args[i + 1]
-            i += 2
-        else:
-            db_paths.append(args[i])
-            i += 1
+    if len(args.db_paths) < 2:
+        parser.error("Need at least 2 databases to compare")
 
-    if len(db_paths) < 2:
-        print("Need at least 2 databases to compare")
-        sys.exit(1)
-
-    os.makedirs(output_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, "SAFEtorch.pt")
+    os.makedirs(args.output, exist_ok=True)
+    model_path = os.path.join(args.model_dir, "SAFEtorch.pt")
     if not os.path.exists(model_path):
         print(f"Model not found: {model_path}")
         sys.exit(1)
 
     print(f"[1/5] Loading model ({DEVICE})...")
-    safe, normalizer = load_model(model_dir)
+    safe, normalizer = SAFE.load(args.model_dir, DEVICE)
 
-    print(f"[2/5] Finding intersection functions across {len(db_paths)} DBs...")
-    mappings, common_keys = get_intersection(db_paths)
+    print(f"[2/5] Finding intersection functions across {len(args.db_paths)} DBs...")
+    mappings, common_keys = get_intersection(args.db_paths)
     print(f"  {len(common_keys):,} common functions")
 
     results = []
-    for idx, (db_path, id_map) in enumerate(zip(db_paths, mappings)):
+    for idx, (db_path, id_map) in enumerate(zip(args.db_paths, mappings)):
         name = os.path.splitext(os.path.basename(db_path))[0]
         print(f"\n{'=' * 50}")
         print(f"Processing {name}")
@@ -287,8 +241,7 @@ def main():
         print(f"    AP:              {result['ap']:.4f}")
         print(f"    Pairs evaluated: {len(scores):,}")
 
-    # Print comparison table
-    names = [os.path.splitext(os.path.basename(p))[0] for p in db_paths]
+    names = [os.path.splitext(os.path.basename(p))[0] for p in args.db_paths]
     print(f"\n{'=' * 60}")
     print(f"{'Metric':<20}", end="")
     for n in names:
@@ -303,7 +256,7 @@ def main():
         print()
     print(f"{'=' * 60}")
 
-    plot_comparison(results, names, output_dir)
+    plot_comparison(results, names, args.output)
 
 
 if __name__ == "__main__":

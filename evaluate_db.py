@@ -1,67 +1,34 @@
 #!/usr/bin/env python3
-import sqlite3, json, os, sys, random
+import sqlite3, json, os, sys, argparse
 import numpy as np
 import torch
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from sklearn.metrics import (
-    roc_curve,
-    roc_auc_score,
-    precision_recall_curve,
-    average_precision_score,
-)
-from tqdm import tqdm
-from safetorch.safe_network import SAFE
-from safetorch.parameters import Config
-from utils.function_normalizer import FunctionNormalizer
+from sklearn.metrics import roc_curve, precision_recall_curve
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from safetorch.safe_network import SAFE
+from utils.db import load_instructions
+from utils.evaluation import Evaluator
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MAX_INSTRUCTIONS = 150
 
 
-def load_model(model_dir):
-    safe = SAFE(Config())
-    safe.load_state_dict(
-        torch.load(os.path.join(model_dir, "SAFEtorch.pt"), map_location=DEVICE)
-    )
-    return safe.to(DEVICE).eval(), FunctionNormalizer(MAX_INSTRUCTIONS)
-
-
-def get_test_pairs(db_path, max_pairs=None):
+def get_test_pairs(db_path, max_false=None):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pairs'")
     if cur.fetchone():
         cur.execute("SELECT id1,id2 FROM pairs WHERE label=1")
         true_pairs = [list(r) for r in cur.fetchall()]
-        n_false = cur.execute("SELECT COUNT(*) FROM pairs WHERE label=0").fetchone()[0]
-        want = max_pairs if max_pairs and n_false > max_pairs else n_false
-        if want == n_false:
-            cur.execute("SELECT id1,id2 FROM pairs WHERE label=0")
-            false_pairs = [list(r) for r in cur.fetchall()]
+        if max_false and max_false > 0:
+            cur.execute("SELECT id1,id2 FROM pairs WHERE label=0 LIMIT ?", (max_false,))
         else:
-            n_chunks = max(1, min(100, want // 1000))
-            chunk_size = want // n_chunks
-            seen = set()
-            false_pairs = []
-            for _ in range(n_chunks * 3):
-                off = random.randint(0, max(0, n_false - chunk_size))
-                cur.execute(
-                    "SELECT id1,id2 FROM pairs WHERE label=0 LIMIT ? OFFSET ?",
-                    (chunk_size, off),
-                )
-                for row in cur.fetchall():
-                    key = (row[0], row[1])
-                    if key not in seen:
-                        seen.add(key)
-                        false_pairs.append([row[0], row[1]])
-                        if len(false_pairs) >= want:
-                            break
-                if len(false_pairs) >= want:
-                    break
+            cur.execute("SELECT id1,id2 FROM pairs WHERE label=0")
+        false_pairs = [list(r) for r in cur.fetchall()]
     else:
         r = cur.execute(
             "SELECT true_pair,false_pair FROM test_pairs WHERE id=0"
@@ -72,57 +39,9 @@ def get_test_pairs(db_path, max_pairs=None):
     return true_pairs, false_pairs
 
 
-def load_instructions(db_path, function_ids):
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    instr = {}
-    for i in range(0, len(function_ids), 900):
-        batch = function_ids[i : i + 900]
-        cur.execute(
-            f"SELECT id,instructions_list FROM filtered_functions "
-            f"WHERE id IN ({','.join('?'*len(batch))})",
-            batch,
-        )
-        for row in cur.fetchall():
-            instr[row[0]] = json.loads(row[1])
-    conn.close()
-    return instr
-
-
-def compute_embeddings(safe, normalizer, instr, batch_size=64):
-    embs = {}
-    items = list(instr.items())
-    for i in tqdm(range(0, len(items), batch_size), desc="Embeddings"):
-        batch = items[i:i + batch_size]
-        fids = [fid for fid, _ in batch]
-        seqs = [ids for _, ids in batch]
-        norm, lens = normalizer.normalize_functions(seqs)
-        with torch.no_grad():
-            out = safe(torch.LongTensor(np.array(norm)).to(DEVICE), torch.LongTensor(lens)).detach().cpu()
-        for fid, emb in zip(fids, out):
-            embs[fid] = emb
-    return embs
-
-
-def evaluate_pairs(embeddings, true_pairs, false_pairs, batch_size=4096):
-    scores, labels = [], []
-    for pairs, label in [(true_pairs, 1), (false_pairs, 0)]:
-        for i in tqdm(range(0, len(pairs), batch_size),
-                      desc=f"{'True' if label else 'False'} pairs"):
-            batch = pairs[i:i + batch_size]
-            emb_a = torch.stack([embeddings[a] for a, _ in batch])
-            emb_b = torch.stack([embeddings[b] for _, b in batch])
-            sim = torch.cosine_similarity(emb_a, emb_b)
-            scores.extend(sim.tolist())
-            labels.extend([label] * len(batch))
-    return np.array(scores), np.array(labels)
-
-
-def plot_metrics(scores, labels, output_dir):
+def plot_metrics(scores, labels, metrics, output_dir):
     n = len(scores)
     thresh = np.linspace(0.01, 0.99, 200)
-
-    print(f"  Computing metrics across {len(thresh)} thresholds...", flush=True)
     tp = np.zeros(200)
     fp = np.zeros(200)
     fn = np.zeros(200)
@@ -139,30 +58,24 @@ def plot_metrics(scores, labels, output_dir):
             fp[i] += np.sum(p & (cl == 0))
             fn[i] += np.sum((~p) & (cl == 1))
             tn[i] += np.sum((~p) & (cl == 0))
-
     total = tp + fp + fn + tn
     acc = np.divide(tp + tn, total, where=total > 0, out=np.zeros(200))
     prec = np.divide(tp, tp + fp, where=(tp + fp) > 0, out=np.zeros(200))
     rec = np.divide(tp, tp + fn, where=(tp + fn) > 0, out=np.zeros(200))
-    pr_plus_rec = prec + rec
-    f1 = np.divide(2 * prec * rec, pr_plus_rec, where=pr_plus_rec > 0, out=np.zeros(200))
+    f1 = np.divide(2 * prec * rec, prec + rec, where=(prec + rec) > 0, out=np.zeros(200))
 
-    print("  Computing ROC / PR curves...", flush=True)
     fpr, tpr, _ = roc_curve(labels, scores)
-    roc_auc = roc_auc_score(labels, scores)
     prc, rec_curve, _ = precision_recall_curve(labels, scores)
-    ap = average_precision_score(labels, scores)
-    bi = np.argmax(f1)
-    bt = thresh[bi]
+    bt = metrics["best_threshold"]
 
     print("\n" + "=" * 45)
     print(f"  Best threshold:          {bt:.4f}")
-    print(f"  Accuracy:                {acc[bi]:.4f}")
-    print(f"  Precision:               {prec[bi]:.4f}")
-    print(f"  Recall:                  {rec[bi]:.4f}")
-    print(f"  F1 Score:                {f1[bi]:.4f}")
-    print(f"  ROC-AUC:                 {roc_auc:.4f}")
-    print(f"  Average Precision (AP):  {ap:.4f}")
+    print(f"  Accuracy:                {metrics['accuracy']:.4f}")
+    print(f"  Precision:               {metrics['precision']:.4f}")
+    print(f"  Recall:                  {metrics['recall']:.4f}")
+    print(f"  F1 Score:                {metrics['f1']:.4f}")
+    print(f"  ROC-AUC:                 {metrics['roc_auc']:.4f}")
+    print(f"  Average Precision (AP):  {metrics['average_precision']:.4f}")
     print("=" * 45 + "\n")
 
     print("  Plotting...", flush=True)
@@ -176,13 +89,13 @@ def plot_metrics(scores, labels, output_dir):
     ax[0, 0].legend()
     ax[0, 0].grid(alpha=0.3)
 
-    ax[0, 1].plot(fpr, tpr, lw=2, label=f"ROC (AUC={roc_auc:.4f})")
+    ax[0, 1].plot(fpr, tpr, lw=2, label=f"ROC (AUC={metrics['roc_auc']:.4f})")
     ax[0, 1].plot([0, 1], [0, 1], "k--", alpha=0.5)
     ax[0, 1].set(xlabel="FPR", ylabel="TPR", title="ROC Curve")
     ax[0, 1].legend()
     ax[0, 1].grid(alpha=0.3)
 
-    ax[1, 0].plot(rec_curve, prc, lw=2, label=f"PR (AP={ap:.4f})")
+    ax[1, 0].plot(rec_curve, prc, lw=2, label=f"PR (AP={metrics['average_precision']:.4f})")
     ax[1, 0].set(xlabel="Recall", ylabel="Precision", title="Precision-Recall Curve")
     ax[1, 0].legend()
     ax[1, 0].grid(alpha=0.3)
@@ -205,48 +118,44 @@ def plot_metrics(scores, labels, output_dir):
     plt.tight_layout()
     fig.savefig(os.path.join(output_dir, "evaluation_results.png"), dpi=150)
     plt.close()
-
     print(f"  Plots saved to {output_dir}/")
 
 
 def main():
-    args = sys.argv[1:]
-    db_path = args[0] if args else "AMD64multipleCompilers.db"
-    model_dir = (
-        args[1]
-        if len(args) > 1
-        else os.path.join(os.path.dirname(os.path.abspath(__file__)), "model")
-    )
-    output_dir = args[2] if len(args) > 2 else "."
-    max_pairs = int(args[3]) if len(args) > 3 else None
-    batch_size = int(args[4]) if len(args) > 4 else 64
-    os.makedirs(output_dir, exist_ok=True)
+    parser = argparse.ArgumentParser(description="Evaluate SAFE model on a pair database")
+    parser.add_argument("db_path")
+    parser.add_argument("--model-dir", default="model")
+    parser.add_argument("--output", default=".")
+    parser.add_argument("--max-false", type=int)
+    parser.add_argument("--batch-size", type=int, default=64)
+    args = parser.parse_args()
+
+    os.makedirs(args.output, exist_ok=True)
+    evaluator = Evaluator(DEVICE, MAX_INSTRUCTIONS)
 
     print(f"[1/5] Loading model ({DEVICE})...")
-    safe, normalizer = load_model(model_dir)
+    safe, _ = SAFE.load(args.model_dir, DEVICE)
 
-    print(f"[2/5] Loading pairs from {db_path}...")
-    true_pairs, false_pairs = get_test_pairs(db_path, max_pairs)
-    if max_pairs and len(true_pairs) > max_pairs:
-        random.seed(42)
-        true_pairs = random.sample(true_pairs, max_pairs)
+    print(f"[2/5] Loading pairs from {args.db_path}...")
+    true_pairs, false_pairs = get_test_pairs(args.db_path, args.max_false)
+    pairs = [(a, b, 1) for a, b in true_pairs] + [(a, b, 0) for a, b in false_pairs]
     print(f"  {len(true_pairs):,} true + {len(false_pairs):,} false")
 
-    fids = sorted(set(i for p in true_pairs + false_pairs for i in p))
+    fids = sorted(set(i for p in pairs for i in p[:2]))
     print(f"  {len(fids):,} unique functions")
 
     print(f"[3/5] Loading instructions...")
-    instr = load_instructions(db_path, fids)
+    instr = load_instructions(args.db_path, fids)
     print(f"  {len(instr):,} loaded")
 
     print(f"[4/5] Computing embeddings...")
-    embeddings = compute_embeddings(safe, normalizer, instr, batch_size)
+    embeddings = evaluator.embed_all(safe, instr, args.batch_size)
 
     print(f"[5/5] Evaluating pairs...")
-    scores, labels = evaluate_pairs(embeddings, true_pairs, false_pairs)
+    scores, labels = evaluator.score_pairs(embeddings, pairs)
+    metrics = evaluator.compute_metrics(scores, labels)
 
-    print(f"\nGenerating plots...")
-    plot_metrics(scores, labels, output_dir)
+    plot_metrics(scores, labels, metrics, args.output)
     print("Done!")
 
 

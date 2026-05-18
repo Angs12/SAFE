@@ -84,7 +84,3 @@ class BinaryAnalyzer:
 
     def get_functions(self):
         return self._functions
-
-    @property
-    def used_fallback(self):
-        return self._fallback
