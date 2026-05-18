@@ -89,27 +89,32 @@ def load_instructions(db_path, function_ids):
     return instr
 
 
-def compute_embeddings(safe, normalizer, instr):
+def compute_embeddings(safe, normalizer, instr, batch_size=64):
     embs = {}
-    for fid, ids in tqdm(instr.items(), desc="Embeddings"):
-        norm, lens = normalizer.normalize_functions([ids])
+    items = list(instr.items())
+    for i in tqdm(range(0, len(items), batch_size), desc="Embeddings"):
+        batch = items[i:i + batch_size]
+        fids = [fid for fid, _ in batch]
+        seqs = [ids for _, ids in batch]
+        norm, lens = normalizer.normalize_functions(seqs)
         with torch.no_grad():
-            embs[fid] = safe(torch.LongTensor(norm[0]).to(DEVICE), torch.LongTensor(lens)).detach().cpu()
+            out = safe(torch.LongTensor(np.array(norm)).to(DEVICE), torch.LongTensor(lens)).detach().cpu()
+        for fid, emb in zip(fids, out):
+            embs[fid] = emb
     return embs
 
 
-def evaluate_pairs(embeddings, true_pairs, false_pairs):
+def evaluate_pairs(embeddings, true_pairs, false_pairs, batch_size=4096):
     scores, labels = [], []
-    for pair in tqdm(true_pairs, desc="True pairs"):
-        scores.append(
-            torch.cosine_similarity(embeddings[pair[0]], embeddings[pair[1]]).item()
-        )
-        labels.append(1)
-    for pair in tqdm(false_pairs, desc="False pairs"):
-        scores.append(
-            torch.cosine_similarity(embeddings[pair[0]], embeddings[pair[1]]).item()
-        )
-        labels.append(0)
+    for pairs, label in [(true_pairs, 1), (false_pairs, 0)]:
+        for i in tqdm(range(0, len(pairs), batch_size),
+                      desc=f"{'True' if label else 'False'} pairs"):
+            batch = pairs[i:i + batch_size]
+            emb_a = torch.stack([embeddings[a] for a, _ in batch])
+            emb_b = torch.stack([embeddings[b] for _, b in batch])
+            sim = torch.cosine_similarity(emb_a, emb_b)
+            scores.extend(sim.tolist())
+            labels.extend([label] * len(batch))
     return np.array(scores), np.array(labels)
 
 
@@ -214,6 +219,7 @@ def main():
     )
     output_dir = args[2] if len(args) > 2 else "."
     max_pairs = int(args[3]) if len(args) > 3 else None
+    batch_size = int(args[4]) if len(args) > 4 else 64
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"[1/5] Loading model ({DEVICE})...")
@@ -234,7 +240,7 @@ def main():
     print(f"  {len(instr):,} loaded")
 
     print(f"[4/5] Computing embeddings...")
-    embeddings = compute_embeddings(safe, normalizer, instr)
+    embeddings = compute_embeddings(safe, normalizer, instr, batch_size)
 
     print(f"[5/5] Evaluating pairs...")
     scores, labels = evaluate_pairs(embeddings, true_pairs, false_pairs)
