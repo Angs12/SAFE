@@ -19,68 +19,24 @@ MARGIN = 0.5
 
 
 class PairDataset:
-    def __init__(self, db_path, max_false=None, val_split=0.0):
+    def __init__(self, db_path, max_false=None):
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
 
-        cur.execute("SELECT DISTINCT project, file_name FROM functions")
-        groups = cur.fetchall()
-        random.Random(42).shuffle(groups)
-        n_val = max(1, int(len(groups) * val_split))
-        val_groups = set(groups[:n_val])
-        train_groups = groups[n_val:]
-        print(f"  {len(train_groups)} train groups, {len(val_groups)} val groups")
+        cur.execute("SELECT name FROM sqlite_master WHERE name='pairs_train'")
+        if not cur.fetchone():
+            print("Error: database has no train/val split. "
+                  "Recreate with: python create_dataset.py --train <binary_folder> <output_db>")
+            sys.exit(1)
 
-        cur.execute("CREATE TEMP TABLE _fid_split (id INTEGER PRIMARY KEY, split INTEGER)")
-        for g_start in range(0, len(train_groups), 100):
-            chunk = train_groups[g_start:g_start + 100]
-            cases = " OR ".join(["(project=? AND file_name=?)" for _ in chunk])
-            params = [v for g in chunk for v in g]
-            cur.execute(
-                f"INSERT INTO _fid_split SELECT id, 0 FROM functions WHERE {cases}",
-                params,
-            )
-        conn.commit()
-        for proj, fname in val_groups:
-            cur.execute(
-                "INSERT INTO _fid_split SELECT id, 1 FROM functions WHERE project=? AND file_name=?",
-                (proj, fname),
-            )
-        conn.commit()
-
-        self.train_pairs = self._load_pairs(cur, split=0, limit=max_false)
-        self.val_pairs = self._load_pairs(cur, split=1)
-        print(
-            f"  Train: {sum(l for _,_,l in self.train_pairs):,} true + {sum(1 for _,_,l in self.train_pairs if l==0):,} false = {len(self.train_pairs):,}"
-        )
-        if self.val_pairs:
-            print(
-                f"  Val:   {sum(l for _,_,l in self.val_pairs):,} true + {sum(1 for _,_,l in self.val_pairs if l==0):,} false = {len(self.val_pairs):,}"
-            )
-
-        train_ids = set(fid for a, b, _ in self.train_pairs for fid in (a, b))
-        val_ids = set(fid for a, b, _ in self.val_pairs for fid in (a, b))
-        self.train_instr = load_instructions(db_path, train_ids)
-        self.val_instr = load_instructions(db_path, val_ids)
-        conn.close()
-
-    def _load_pairs(self, cur, split, limit=None):
-        pair_sql = """
-            SELECT p.id1, p.id2, p.label FROM pairs p
-            WHERE EXISTS (SELECT 1 FROM _fid_split WHERE id=p.id1 AND split=?)
-              AND EXISTS (SELECT 1 FROM _fid_split WHERE id=p.id2 AND split=?)
-        """
-
-        if limit:
-            cur.execute(pair_sql + " AND label=1", (split, split))
-            true_pairs = [(a, b) for a, b, _ in cur.fetchall()]
-            cur.execute(
-                pair_sql + " AND label=0 ORDER BY RANDOM() LIMIT ?",
-                (split, split, limit),
-            )
-            false_pairs = [(a, b) for a, b, _ in cur.fetchall()]
+        if max_false:
+            cur.execute("SELECT id1,id2 FROM pairs_train WHERE label=1")
+            true_pairs = cur.fetchall()
+            cur.execute("SELECT id1,id2 FROM pairs_train WHERE label=0 ORDER BY RANDOM() LIMIT ?",
+                        (max_false,))
+            false_pairs = cur.fetchall()
         else:
-            cur.execute(pair_sql, (split, split))
+            cur.execute("SELECT id1,id2,label FROM pairs_train")
             all_rows = cur.fetchall()
             true_pairs = [(a, b) for a, b, l in all_rows if l == 1]
             false_pairs = [(a, b) for a, b, l in all_rows if l == 0]
@@ -88,9 +44,26 @@ class PairDataset:
                 random.Random(42).shuffle(false_pairs)
                 false_pairs = false_pairs[:len(true_pairs)]
 
-        pairs = [(a, b, 1) for a, b in true_pairs] + [(a, b, 0) for a, b in false_pairs]
-        random.Random(42).shuffle(pairs)
-        return pairs
+        self.train_pairs = ([(a, b, 1) for a, b in true_pairs] +
+                            [(a, b, 0) for a, b in false_pairs])
+        random.Random(42).shuffle(self.train_pairs)
+
+        cur.execute("SELECT id1,id2,label FROM pairs_val")
+        self.val_pairs = [(a, b, l) for a, b, l in cur.fetchall()]
+
+        print(
+            f"  Train: {sum(1 for _,_,l in self.train_pairs if l==1):,} true + {sum(1 for _,_,l in self.train_pairs if l==0):,} false = {len(self.train_pairs):,}"
+        )
+        if self.val_pairs:
+            print(
+                f"  Val:   {sum(1 for _,_,l in self.val_pairs if l==1):,} true + {sum(1 for _,_,l in self.val_pairs if l==0):,} false = {len(self.val_pairs):,}"
+            )
+
+        train_ids = set(fid for a, b, _ in self.train_pairs for fid in (a, b))
+        val_ids = set(fid for a, b, _ in self.val_pairs for fid in (a, b))
+        self.train_instr = load_instructions(db_path, train_ids)
+        self.val_instr = load_instructions(db_path, val_ids)
+        conn.close()
 
     def evaluate(self, safe, evaluator):
         if not self.val_pairs:
@@ -121,7 +94,6 @@ def main():
     parser.add_argument("--max-false", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--val-split", type=float, default=0.05)
     args = parser.parse_args()
 
     output_path = args.output or os.path.join(args.model_dir, "SAFEtorch_finetuned.pt")
@@ -141,7 +113,7 @@ def main():
         print(f"  Using {DEVICE}" + (f" ({n_gpu} GPU)" if n_gpu == 1 else ""))
 
     print(f"[2/4] Loading pairs from {args.db_path}...")
-    dataset = PairDataset(args.db_path, args.max_false, args.val_split)
+    dataset = PairDataset(args.db_path, args.max_false)
     n = len(dataset.train_pairs)
     evaluator = Evaluator(DEVICE, MAX_INSTRUCTIONS)
 
@@ -192,20 +164,17 @@ def main():
 
         line = f"  Epoch {epoch+1}/{args.epochs}  avg_loss={total_loss/n_batches:.6f}  [{time.time()-t0:.0f}s]"
 
-        if args.val_split:
-            metrics = dataset.evaluate(safe, evaluator)
-            if metrics:
-                line += f"  val_f1={metrics['f1']:.4f}  val_acc={metrics['accuracy']:.4f}  val_auc={metrics['roc_auc']:.4f}"
-                if metrics["f1"] > best_f1:
-                    best_f1 = metrics["f1"]
-                    torch.save(_unwrap_state_dict(safe), output_path)
-                    line += "  *saved*"
-        else:
-            torch.save(_unwrap_state_dict(safe), output_path)
+        metrics = dataset.evaluate(safe, evaluator)
+        if metrics:
+            line += f"  val_f1={metrics['f1']:.4f}  val_acc={metrics['accuracy']:.4f}  val_auc={metrics['roc_auc']:.4f}"
+            if metrics["f1"] > best_f1:
+                best_f1 = metrics["f1"]
+                torch.save(_unwrap_state_dict(safe), output_path)
+                line += "  *saved*"
 
         print(line)
 
-    if args.val_split and best_f1 == 0.0:
+    if best_f1 == 0.0:
         torch.save(_unwrap_state_dict(safe), output_path)
     print(f"[4/4] Model saved to {output_path}")
     print("Done!")

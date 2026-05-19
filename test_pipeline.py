@@ -3,14 +3,13 @@
 
 import sqlite3, json, os, sys, subprocess, tempfile, shutil
 import random
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from safetorch.parameters import Config
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(PROJECT_DIR, "model")
-MAX_EMBED_ID = Config().num_embeddings - 1  # 527682
+MAX_EMBED_ID = Config().num_embeddings - 1
 MAX_INSTRUCTIONS = 150
 
 
@@ -60,7 +59,6 @@ def create_synthetic_db(db_path):
                     )
                     fid += 1
 
-    # True pairs: same proj, fname, function_name; different optimization
     for proj in projects:
         for fname in file_names:
             cur.execute("""
@@ -74,13 +72,11 @@ def create_synthetic_db(db_path):
                   AND a.optimization='O0' AND b.optimization='O1'
             """, (proj, fname, proj, fname))
 
-    # False pairs: different function_name within same group
     id_pool = []
     cur.execute("SELECT id, function_name FROM functions ORDER BY id")
     for row in cur.fetchall():
         id_pool.append(row)
 
-    false_added = 0
     for i in range(len(id_pool)):
         for j in range(i + 1, len(id_pool)):
             id1, fn1 = id_pool[i]
@@ -90,7 +86,6 @@ def create_synthetic_db(db_path):
                     "INSERT INTO pairs VALUES (?,?,0)",
                     (min(id1, id2), max(id1, id2)),
                 )
-                false_added += 1
 
     conn.commit()
 
@@ -98,27 +93,75 @@ def create_synthetic_db(db_path):
     n_false = cur.execute("SELECT COUNT(*) FROM pairs WHERE label=0").fetchone()[0]
     conn.close()
     print(f"Created synthetic DB: {fid-1} functions, {n_true} true pairs, {n_false} false pairs")
-    return True
+
+
+def add_train_val_split(db_path):
+    """Add pairs_train/pairs_val tables (mimics create_dataset.py --train)."""
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+
+    cur.execute("SELECT DISTINCT project, file_name FROM functions")
+    groups = cur.fetchall()
+    random.Random(42).shuffle(groups)
+    n_val = max(1, int(len(groups) * 0.05))
+    val_groups = set(groups[:n_val])
+    train_groups = groups[n_val:]
+    print(f"  {len(train_groups)} train groups, {len(val_groups)} val groups")
+
+    cur.execute("CREATE TEMP TABLE _fid_tag (id INTEGER PRIMARY KEY, tag INTEGER)")
+    for g_start in range(0, len(train_groups), 100):
+        chunk = train_groups[g_start:g_start + 100]
+        cases = " OR ".join(["(project=? AND file_name=?)" for _ in chunk])
+        params = [v for g in chunk for v in g]
+        cur.execute(
+            f"INSERT INTO _fid_tag SELECT id, 0 FROM functions WHERE {cases}", params)
+    for proj, fname in val_groups:
+        cur.execute(
+            "INSERT INTO _fid_tag SELECT id, 1 FROM functions WHERE project=? AND file_name=?",
+            (proj, fname))
+    conn.commit()
+
+    for tag, tbl in [(0, "pairs_train"), (1, "pairs_val")]:
+        cur.execute(f"""
+            CREATE TABLE {tbl} AS
+            SELECT p.id1, p.id2, p.label FROM pairs p
+            WHERE EXISTS (SELECT 1 FROM _fid_tag WHERE id=p.id1 AND tag=?)
+              AND EXISTS (SELECT 1 FROM _fid_tag WHERE id=p.id2 AND tag=?)""", (tag, tag))
+        cur.execute(f"CREATE INDEX idx_{tbl}_label ON {tbl}(label)")
+        cur.execute(f"CREATE INDEX idx_{tbl}_id1 ON {tbl}(id1)")
+        cur.execute(f"CREATE INDEX idx_{tbl}_id2 ON {tbl}(id2)")
+
+    conn.commit()
+    cur.execute("DROP TABLE _fid_tag")
+    conn.commit()
+
+    n_train = cur.execute("SELECT COUNT(*) FROM pairs_train").fetchone()[0]
+    n_val = cur.execute("SELECT COUNT(*) FROM pairs_val").fetchone()[0]
+    conn.close()
+    print(f"  Train pairs: {n_train:,}  Val pairs: {n_val:,}")
 
 
 def run_test():
     tmpdir = tempfile.mkdtemp(prefix="safe_test_")
-    db_path = os.path.join(tmpdir, "test.db")
+    db_test = os.path.join(tmpdir, "test.db")
+    db_train = os.path.join(tmpdir, "train.db")
 
     try:
-        # Step 1: Create synthetic database
+        # Step 1: Test-mode DB → evaluate_db.py
         print("=" * 60)
-        print("Step 1: Creating synthetic database...")
+        print("Step 1: Creating test DB...")
         print("=" * 60)
-        create_synthetic_db(db_path)
+        create_synthetic_db(db_test)
+        conn = sqlite3.connect(db_test)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pairs_label ON pairs(label)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pairs_id1 ON pairs(id1)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pairs_id2 ON pairs(id2)")
+        conn.commit()
+        conn.close()
 
-        # Step 2: Run evaluate_db.py
-        print("\n" + "=" * 60)
-        print("Step 2: Running evaluate_db.py...")
-        print("=" * 60)
         eval_result = subprocess.run(
             [sys.executable, os.path.join(PROJECT_DIR, "evaluate_db.py"),
-             db_path, "--model-dir", MODEL_DIR, "--output", tmpdir,
+             db_test, "--model-dir", MODEL_DIR, "--output", tmpdir,
              "--max-false", "10", "--batch-size", "64"],
             capture_output=True, text=True, cwd=PROJECT_DIR,
         )
@@ -126,61 +169,62 @@ def run_test():
         if eval_result.stderr:
             print("STDERR:", eval_result.stderr[:500], file=sys.stderr)
         if eval_result.returncode != 0:
-            print(f"evaluate_db.py FAILED with code {eval_result.returncode}", file=sys.stderr)
+            print(f"evaluate_db.py FAILED", file=sys.stderr)
             return False
         if "F1 Score" not in eval_result.stdout:
-            print("evaluate_db.py: metrics not found in output", file=sys.stderr)
+            print("evaluate_db.py: metrics not found", file=sys.stderr)
             return False
         print("evaluate_db.py PASSED")
 
-        # Step 3: Run finetune_safe.py (1 epoch, no val split)
+        # Step 2: Train-mode DB → finetune_safe.py
         print("\n" + "=" * 60)
-        print("Step 3: Running finetune_safe.py...")
+        print("Step 2: Creating train DB...")
         print("=" * 60)
+        create_synthetic_db(db_train)
+        add_train_val_split(db_train)
+
         output_model = os.path.join(tmpdir, "finetuned.pt")
         ft_result = subprocess.run(
             [sys.executable, os.path.join(PROJECT_DIR, "finetune_safe.py"),
-             db_path, "--model-dir", MODEL_DIR, "--output", output_model,
-             "--max-false", "10", "--epochs", "1", "--batch-size", "512",
-             "--val-split", "0.0"],
+             db_train, "--model-dir", MODEL_DIR, "--output", output_model,
+             "--max-false", "10", "--epochs", "1", "--batch-size", "512"],
             capture_output=True, text=True, cwd=PROJECT_DIR,
         )
         print(ft_result.stdout)
         if ft_result.stderr:
             print("STDERR:", ft_result.stderr[:500], file=sys.stderr)
         if ft_result.returncode != 0:
-            print(f"finetune_safe.py FAILED with code {ft_result.returncode}", file=sys.stderr)
+            print(f"finetune_safe.py FAILED", file=sys.stderr)
             return False
         if not os.path.exists(output_model):
-            print(f"finetune_safe.py: output model not found at {output_model}", file=sys.stderr)
+            print(f"finetune_safe.py: output model not found", file=sys.stderr)
             return False
         print("finetune_safe.py PASSED")
 
-        # Step 4: finetune_safe.py with val split
+        # Step 3: finetune_safe.py with more epochs (tests best-f1 checkpointing)
         print("\n" + "=" * 60)
-        print("Step 4: Running finetune_safe.py with validation split...")
+        print("Step 3: Running finetune_safe.py (2 epochs)...")
         print("=" * 60)
-        output_model2 = os.path.join(tmpdir, "finetuned_val.pt")
+        output_model2 = os.path.join(tmpdir, "finetuned_2ep.pt")
         ft2_result = subprocess.run(
             [sys.executable, os.path.join(PROJECT_DIR, "finetune_safe.py"),
-             db_path, "--model-dir", MODEL_DIR, "--output", output_model2,
-             "--max-false", "10", "--epochs", "2", "--batch-size", "512",
-             "--val-split", "0.3"],
+             db_train, "--model-dir", MODEL_DIR, "--output", output_model2,
+             "--max-false", "10", "--epochs", "2", "--batch-size", "512"],
             capture_output=True, text=True, cwd=PROJECT_DIR,
         )
         print(ft2_result.stdout)
         if ft2_result.stderr:
             print("STDERR:", ft2_result.stderr[:500], file=sys.stderr)
         if ft2_result.returncode != 0:
-            print(f"finetune_safe.py (val) FAILED with code {ft2_result.returncode}", file=sys.stderr)
+            print(f"finetune_safe.py (2 epoch) FAILED", file=sys.stderr)
             return False
         if not os.path.exists(output_model2):
-            print(f"finetune_safe.py (val): output not found", file=sys.stderr)
+            print(f"finetune_safe.py (2 epoch): output not found", file=sys.stderr)
             return False
         if "val_f1" not in ft2_result.stdout:
-            print("finetune_safe.py (val): val metrics not found", file=sys.stderr)
+            print("finetune_safe.py (2 epoch): val metrics not found", file=sys.stderr)
             return False
-        print("finetune_safe.py (val) PASSED")
+        print("finetune_safe.py (2 epoch) PASSED")
 
         print("\n" + "=" * 60)
         print("ALL PIPELINE TESTS PASSED")

@@ -119,57 +119,64 @@ def generate_pairs(conn):
                       AND b.optimization=? AND a.function_name=b.function_name
                 """, (p, f, p, f, opts[i], opts[j]))
 
-        num_opt_pairs = len(opts) * (len(opts) - 1) // 2
-        if num_opt_pairs == 0:
+        if len(opts) < 2:
             continue
-        total_true = cur.execute(
-            "SELECT COUNT(*) FROM pair_buf WHERE label=1").fetchone()[0]
-        limit = max(total_true * 5 // num_opt_pairs, 5000)
 
         for i in range(len(opts)):
             for j in range(i + 1, len(opts)):
-                m1 = dict(cur.execute(
-                    "SELECT function_name,id FROM functions "
-                    "WHERE project=? AND file_name=? AND optimization=?",
-                    (p, f, opts[i])).fetchall())
-                m2 = dict(cur.execute(
-                    "SELECT function_name,id FROM functions "
-                    "WHERE project=? AND file_name=? AND optimization=?",
-                    (p, f, opts[j])).fetchall())
-
-                names1, ids1 = list(m1.keys()), list(m1.values())
-                names2, ids2 = list(m2.keys()), list(m2.values())
-                n1, n2 = len(ids1), len(ids2)
-                same_count = sum(1 for n in names1 if n in m2)
-                total_valid = n1 * n2 - same_count
-                sample_size = min(limit, total_valid)
-
-                batch = []
-                if sample_size == total_valid:
-                    for ni, a in zip(names1, ids1):
-                        for nj, b in zip(names2, ids2):
-                            if ni != nj:
-                                batch.append((min(a, b), max(a, b), 0))
-                elif sample_size > 0:
-                    seen = set()
-                    rng = random.Random(42)
-                    while len(batch) < sample_size:
-                        idx = rng.randrange(n1 * n2)
-                        if idx in seen:
-                            continue
-                        seen.add(idx)
-                        ii, jj = divmod(idx, n2)
-                        if names1[ii] != names2[jj]:
-                            a, b = ids1[ii], ids2[jj]
-                            batch.append((min(a, b), max(a, b), 0))
-
-                for k in range(0, len(batch), 5000):
-                    cur.executemany(
-                        "INSERT INTO pair_buf VALUES (?,?,?)",
-                        batch[k:k + 5000])
+                cur.execute("""
+                    INSERT INTO pair_buf (id1,id2,label)
+                    SELECT DISTINCT
+                        CASE WHEN a.id < b.id THEN a.id ELSE b.id END,
+                        CASE WHEN a.id < b.id THEN b.id ELSE a.id END,
+                        0
+                    FROM functions a, functions b
+                    WHERE a.project=? AND a.file_name=?
+                      AND b.project=? AND b.file_name=?
+                      AND a.optimization=? AND b.optimization=?
+                      AND a.function_name != b.function_name
+                """, (p, f, p, f, opts[i], opts[j]))
         conn.commit()
 
     cur.execute("ALTER TABLE pair_buf RENAME TO pairs")
+    conn.commit()
+
+
+def split_pairs_train_val(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT project, file_name FROM functions")
+    groups = cur.fetchall()
+    random.Random(42).shuffle(groups)
+    n_val = max(1, int(len(groups) * 0.05))
+    val_groups = set(groups[:n_val])
+    train_groups = groups[n_val:]
+    print(f"  {len(train_groups)} train groups, {len(val_groups)} val groups")
+
+    cur.execute("CREATE TEMP TABLE _fid_tag (id INTEGER PRIMARY KEY, tag INTEGER)")
+    for g_start in range(0, len(train_groups), 100):
+        chunk = train_groups[g_start:g_start + 100]
+        cases = " OR ".join(["(project=? AND file_name=?)" for _ in chunk])
+        params = [v for g in chunk for v in g]
+        cur.execute(
+            f"INSERT INTO _fid_tag SELECT id, 0 FROM functions WHERE {cases}", params)
+    for proj, fname in val_groups:
+        cur.execute(
+            "INSERT INTO _fid_tag SELECT id, 1 FROM functions WHERE project=? AND file_name=?",
+            (proj, fname))
+    conn.commit()
+
+    for tag, tbl in [(0, "pairs_train"), (1, "pairs_val")]:
+        cur.execute(f"""
+            CREATE TABLE {tbl} AS
+            SELECT p.id1, p.id2, p.label FROM pairs p
+            WHERE EXISTS (SELECT 1 FROM _fid_tag WHERE id=p.id1 AND tag=?)
+              AND EXISTS (SELECT 1 FROM _fid_tag WHERE id=p.id2 AND tag=?)""", (tag, tag))
+        cur.execute(f"CREATE INDEX idx_{tbl}_label ON {tbl}(label)")
+        cur.execute(f"CREATE INDEX idx_{tbl}_id1 ON {tbl}(id1)")
+        cur.execute(f"CREATE INDEX idx_{tbl}_id2 ON {tbl}(id2)")
+
+    conn.commit()
+    cur.execute("DROP TABLE _fid_tag")
     conn.commit()
 
 
@@ -182,6 +189,8 @@ def main():
                         os.path.abspath(__file__)), "model"))
     ap.add_argument("--max-groups", type=int)
     ap.add_argument("--workers", type=int, default=min(os.cpu_count(), 2))
+    ap.add_argument("--train", action="store_true",
+                    help="Create train/val split (for finetuning)")
     args = ap.parse_args()
 
     w2id_path = os.path.join(args.model_dir, "word2id.json")
@@ -254,11 +263,18 @@ def main():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pairs_id2 ON pairs(id2)")
     conn.commit()
 
+    if args.train:
+        print(f"Splitting pairs into train/val...")
+        split_pairs_train_val(conn)
+
     n1 = cur.execute("SELECT COUNT(*) FROM pairs WHERE label=1").fetchone()[0]
     n0 = cur.execute("SELECT COUNT(*) FROM pairs WHERE label=0").fetchone()[0]
     conn.close()
     print(f"  True pairs: {n1:,}  False pairs: {n0:,}")
-    print(f"\nDone. Run: python evaluate_db.py {args.output_db} {args.model_dir} .")
+    if args.train:
+        print(f"\nDone. Run: python finetune_safe.py {args.output_db} --model-dir {args.model_dir}")
+    else:
+        print(f"\nDone. Run: python evaluate_db.py {args.output_db} --model-dir {args.model_dir}")
 
 
 if __name__ == "__main__":
