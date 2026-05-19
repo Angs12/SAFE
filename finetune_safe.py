@@ -118,7 +118,7 @@ def main():
     parser.add_argument("db_path")
     parser.add_argument("--model-dir", default="model")
     parser.add_argument("--output", default=None)
-    parser.add_argument("--max-false", type=int, default=10000)
+    parser.add_argument("--max-false", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--val-split", type=float, default=0.05)

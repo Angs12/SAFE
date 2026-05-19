@@ -248,6 +248,12 @@ def main():
     print(f"Generating pairs...")
     generate_pairs(conn)
 
+    print(f"Building indexes on pairs table...")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pairs_label ON pairs(label)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pairs_id1 ON pairs(id1)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pairs_id2 ON pairs(id2)")
+    conn.commit()
+
     n1 = cur.execute("SELECT COUNT(*) FROM pairs WHERE label=1").fetchone()[0]
     n0 = cur.execute("SELECT COUNT(*) FROM pairs WHERE label=0").fetchone()[0]
     conn.close()
