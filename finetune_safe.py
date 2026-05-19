@@ -4,6 +4,7 @@
 import sqlite3, json, os, sys, random, time, argparse
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.optim as optim
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -99,6 +100,10 @@ class PairDataset:
         return evaluator.compute_metrics(scores, labels)
 
 
+def _unwrap_state_dict(model):
+    return model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+
+
 def embed_batch(normalizer, safe, seqs):
     norm, lens = normalizer.normalize_functions(seqs)
     with torch.set_grad_enabled(True):
@@ -126,6 +131,14 @@ def main():
     frozen = sum(p.numel() for p in safe.parameters() if not p.requires_grad)
     trainable = sum(p.numel() for p in safe.parameters() if p.requires_grad)
     print(f"  {frozen:,} frozen (embedding), {trainable:,} trainable (RNN+attention+dense)")
+
+    n_gpu = torch.cuda.device_count()
+    if n_gpu >= 2:
+        gpu_ids = list(range(min(2, n_gpu)))
+        safe = nn.DataParallel(safe, device_ids=gpu_ids)
+        print(f"  Using {len(gpu_ids)} GPUs: {gpu_ids}")
+    else:
+        print(f"  Using {DEVICE}" + (f" ({n_gpu} GPU)" if n_gpu == 1 else ""))
 
     print(f"[2/4] Loading pairs from {args.db_path}...")
     dataset = PairDataset(args.db_path, args.max_false, args.val_split)
@@ -185,15 +198,15 @@ def main():
                 line += f"  val_f1={metrics['f1']:.4f}  val_acc={metrics['accuracy']:.4f}  val_auc={metrics['roc_auc']:.4f}"
                 if metrics["f1"] > best_f1:
                     best_f1 = metrics["f1"]
-                    torch.save(safe.state_dict(), output_path)
+                    torch.save(_unwrap_state_dict(safe), output_path)
                     line += "  *saved*"
         else:
-            torch.save(safe.state_dict(), output_path)
+            torch.save(_unwrap_state_dict(safe), output_path)
 
         print(line)
 
     if args.val_split and best_f1 == 0.0:
-        torch.save(safe.state_dict(), output_path)
+        torch.save(_unwrap_state_dict(safe), output_path)
     print(f"[4/4] Model saved to {output_path}")
     print("Done!")
 
