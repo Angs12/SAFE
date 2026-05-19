@@ -111,30 +111,26 @@ def generate_pairs(conn):
             for j in range(i + 1, len(opts)):
                 cur.execute("""
                     INSERT INTO pair_buf (id1,id2,label)
-                    SELECT CASE WHEN a.id<b.id THEN a.id ELSE b.id END,
-                           CASE WHEN a.id<b.id THEN b.id ELSE a.id END,1
-                    FROM functions a,functions b
-                    WHERE a.project=? AND a.file_name=? AND b.project=?
-                      AND b.file_name=? AND a.optimization=?
-                      AND b.optimization=? AND a.function_name=b.function_name
+                    SELECT
+                        CASE WHEN a.id < b.id THEN a.id ELSE b.id END,
+                        CASE WHEN a.id < b.id THEN b.id ELSE a.id END,
+                        1
+                    FROM functions a, functions b
+                    WHERE a.project=? AND a.file_name=? AND b.project=? AND b.file_name=?
+                      AND a.optimization=? AND b.optimization=?
+                      AND a.function_name = b.function_name
                 """, (p, f, p, f, opts[i], opts[j]))
-
-        if len(opts) < 2:
-            continue
-
-        for i in range(len(opts)):
-            for j in range(i + 1, len(opts)):
                 cur.execute("""
                     INSERT INTO pair_buf (id1,id2,label)
-                    SELECT DISTINCT
+                    SELECT
                         CASE WHEN a.id < b.id THEN a.id ELSE b.id END,
                         CASE WHEN a.id < b.id THEN b.id ELSE a.id END,
                         0
                     FROM functions a, functions b
-                    WHERE a.project=? AND a.file_name=?
-                      AND b.project=? AND b.file_name=?
+                    WHERE a.project=? AND a.file_name=? AND b.project=? AND b.file_name=?
                       AND a.optimization=? AND b.optimization=?
                       AND a.function_name != b.function_name
+                    LIMIT 5000
                 """, (p, f, p, f, opts[i], opts[j]))
         conn.commit()
 
@@ -171,10 +167,6 @@ def split_pairs_train_val(conn):
             SELECT p.id1, p.id2, p.label FROM pairs p
             WHERE EXISTS (SELECT 1 FROM _fid_tag WHERE id=p.id1 AND tag=?)
               AND EXISTS (SELECT 1 FROM _fid_tag WHERE id=p.id2 AND tag=?)""", (tag, tag))
-        cur.execute(f"CREATE INDEX idx_{tbl}_label ON {tbl}(label)")
-        cur.execute(f"CREATE INDEX idx_{tbl}_id1 ON {tbl}(id1)")
-        cur.execute(f"CREATE INDEX idx_{tbl}_id2 ON {tbl}(id2)")
-
     conn.commit()
     cur.execute("DROP TABLE _fid_tag")
     conn.commit()
@@ -256,12 +248,6 @@ def main():
 
     print(f"Generating pairs...")
     generate_pairs(conn)
-
-    print(f"Building indexes on pairs table...")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_pairs_label ON pairs(label)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_pairs_id1 ON pairs(id1)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_pairs_id2 ON pairs(id2)")
-    conn.commit()
 
     if args.train:
         print(f"Splitting pairs into train/val...")
