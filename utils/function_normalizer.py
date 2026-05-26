@@ -5,7 +5,27 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+import re
 import numpy as np
+
+
+_CLONE_RE = re.compile(
+    r'\.('
+    r'isra\.\d+|constprop\.\d+|lto_priv\.\d+|_omp_fn\.\d+|'
+    r'eh\.\d+|resxl\.\d+|localalias\.\d+|'
+    r'specialized\.\d+|thinlto\.\d+|fulllto\.\d+|'
+    r'argprom|argelim|retelim'
+    r')$'
+)
+
+
+def strip_clone_suffix(name):
+    while True:
+        new_name = _CLONE_RE.sub('', name)
+        if new_name == name:
+            break
+        name = new_name
+    return name
 
 
 class FunctionNormalizer:

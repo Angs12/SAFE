@@ -4,18 +4,20 @@ from collections import defaultdict
 from multiprocessing import Pool
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils.capstone_disassembler import disassemble
 from utils.radare_analyzer import BinaryAnalyzer
+from utils.instructions_converter import InstructionsConverter
+from utils.function_normalizer import strip_clone_suffix
 
 FILENAME_RE = re.compile(r"^(.+?)-(.+?)-(O0|O1|O2|O3|Os)-([a-f0-9]{32})$")
-_I2ID = None  # global in worker processes
+_CONVERTER = None  # global in worker processes
+_STRIP_SUFFIX = True
 
 
-def init_worker(w2id_path):
-    global _I2ID
-    with open(w2id_path) as f:
-        _I2ID = json.load(f)
+def init_worker(w2id_path, strip_suffix=True):
+    global _CONVERTER, _STRIP_SUFFIX
+    _CONVERTER = InstructionsConverter(w2id_path)
+    _STRIP_SUFFIX = strip_suffix
 
 
 def parse_binary_filename(name):
@@ -26,23 +28,8 @@ def parse_binary_filename(name):
             "optimization": m.group(3), "hash": m.group(4), "name": name}
 
 
-def convert_ids(instructions, i2id):
-    ret = []
-    for x in instructions:
-        if x in i2id:
-            ret.append(i2id[x] + 1)
-        elif "X_" in x:
-            ret.append(i2id["X_UNK"] + 1)
-        elif "A_" in x:
-            ret.append(i2id["A_UNK"] + 1)
-        else:
-            ret.append(i2id["X_UNK"] + 1)
-    return ret
-
-
 def process_single_binary(args):
     path, meta = args
-    global _I2ID
     analyzer = None
     try:
         analyzer = BinaryAnalyzer(path)
@@ -65,8 +52,8 @@ def process_single_binary(args):
                 instructions = disassemble(asm_hex, analyzer.arch, analyzer.bits)
                 if not instructions:
                     continue
-                converted = convert_ids(instructions, _I2ID)
-                functions.append({"name": fn_name, "asm_hex": asm_hex,
+                converted = _CONVERTER.convert_to_ids(instructions)
+                functions.append({"name": strip_clone_suffix(fn_name) if _STRIP_SUFFIX else fn_name, "asm_hex": asm_hex,
                                   "raw_ids": converted,
                                   "num_instructions": len(converted)})
             except Exception:
@@ -183,6 +170,8 @@ def main():
     ap.add_argument("--workers", type=int, default=min(os.cpu_count(), 2))
     ap.add_argument("--train", action="store_true",
                     help="Create train/val split (for finetuning)")
+    ap.add_argument("--no-strip", action="store_true",
+                    help="Do not strip compiler clone suffixes from function names")
     args = ap.parse_args()
 
     w2id_path = os.path.join(args.model_dir, "word2id.json")
@@ -219,7 +208,7 @@ def main():
     fid = 1
 
     with Pool(args.workers, initializer=init_worker,
-              initargs=(w2id_path,), maxtasksperchild=50) as pool:
+              initargs=(w2id_path, not args.no_strip), maxtasksperchild=50) as pool:
         for r in tqdm(pool.imap_unordered(
                 process_single_binary,
                 [(p, m) for p, m in binary_list],

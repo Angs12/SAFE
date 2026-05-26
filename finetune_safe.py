@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from safetorch.safe_network import SAFE
 from utils.db import load_instructions
 from utils.function_normalizer import FunctionNormalizer

@@ -4,8 +4,8 @@
 import sqlite3, json, os, sys, subprocess, tempfile, shutil
 import random
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from safetorch.parameters import Config
+from create_dataset import split_pairs_train_val
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(PROJECT_DIR, "model")
@@ -95,52 +95,6 @@ def create_synthetic_db(db_path):
     print(f"Created synthetic DB: {fid-1} functions, {n_true} true pairs, {n_false} false pairs")
 
 
-def add_train_val_split(db_path):
-    """Add pairs_train/pairs_val tables (mimics create_dataset.py --train)."""
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-
-    cur.execute("SELECT DISTINCT project, file_name FROM functions")
-    groups = cur.fetchall()
-    random.Random(42).shuffle(groups)
-    n_val = max(1, int(len(groups) * 0.05))
-    val_groups = set(groups[:n_val])
-    train_groups = groups[n_val:]
-    print(f"  {len(train_groups)} train groups, {len(val_groups)} val groups")
-
-    cur.execute("CREATE TEMP TABLE _fid_tag (id INTEGER PRIMARY KEY, tag INTEGER)")
-    for g_start in range(0, len(train_groups), 100):
-        chunk = train_groups[g_start:g_start + 100]
-        cases = " OR ".join(["(project=? AND file_name=?)" for _ in chunk])
-        params = [v for g in chunk for v in g]
-        cur.execute(
-            f"INSERT INTO _fid_tag SELECT id, 0 FROM functions WHERE {cases}", params)
-    for proj, fname in val_groups:
-        cur.execute(
-            "INSERT INTO _fid_tag SELECT id, 1 FROM functions WHERE project=? AND file_name=?",
-            (proj, fname))
-    conn.commit()
-
-    for tag, tbl in [(0, "pairs_train"), (1, "pairs_val")]:
-        cur.execute(f"""
-            CREATE TABLE {tbl} AS
-            SELECT p.id1, p.id2, p.label FROM pairs p
-            WHERE EXISTS (SELECT 1 FROM _fid_tag WHERE id=p.id1 AND tag=?)
-              AND EXISTS (SELECT 1 FROM _fid_tag WHERE id=p.id2 AND tag=?)""", (tag, tag))
-        cur.execute(f"CREATE INDEX idx_{tbl}_label ON {tbl}(label)")
-        cur.execute(f"CREATE INDEX idx_{tbl}_id1 ON {tbl}(id1)")
-        cur.execute(f"CREATE INDEX idx_{tbl}_id2 ON {tbl}(id2)")
-
-    conn.commit()
-    cur.execute("DROP TABLE _fid_tag")
-    conn.commit()
-
-    n_train = cur.execute("SELECT COUNT(*) FROM pairs_train").fetchone()[0]
-    n_val = cur.execute("SELECT COUNT(*) FROM pairs_val").fetchone()[0]
-    conn.close()
-    print(f"  Train pairs: {n_train:,}  Val pairs: {n_val:,}")
-
-
 def run_test():
     tmpdir = tempfile.mkdtemp(prefix="safe_test_")
     db_test = os.path.join(tmpdir, "test.db")
@@ -152,12 +106,6 @@ def run_test():
         print("Step 1: Creating test DB...")
         print("=" * 60)
         create_synthetic_db(db_test)
-        conn = sqlite3.connect(db_test)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_pairs_label ON pairs(label)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_pairs_id1 ON pairs(id1)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_pairs_id2 ON pairs(id2)")
-        conn.commit()
-        conn.close()
 
         eval_result = subprocess.run(
             [sys.executable, os.path.join(PROJECT_DIR, "evaluate_db.py"),
@@ -181,7 +129,9 @@ def run_test():
         print("Step 2: Creating train DB...")
         print("=" * 60)
         create_synthetic_db(db_train)
-        add_train_val_split(db_train)
+        conn = sqlite3.connect(db_train)
+        split_pairs_train_val(conn)
+        conn.close()
 
         output_model = os.path.join(tmpdir, "finetuned.pt")
         ft_result = subprocess.run(

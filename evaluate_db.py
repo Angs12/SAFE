@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import sqlite3, json, os, sys, argparse
+import sqlite3, os, sys, argparse
 import numpy as np
 import torch
 import matplotlib
@@ -8,7 +8,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, precision_recall_curve
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from safetorch.safe_network import SAFE
 from utils.db import load_instructions
 from utils.evaluation import Evaluator
@@ -20,21 +19,13 @@ MAX_INSTRUCTIONS = 150
 def get_test_pairs(db_path, max_false=None):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pairs'")
-    if cur.fetchone():
-        cur.execute("SELECT id1,id2 FROM pairs WHERE label=1")
-        true_pairs = [list(r) for r in cur.fetchall()]
-        if max_false and max_false > 0:
-            cur.execute("SELECT id1,id2 FROM pairs WHERE label=0 LIMIT ?", (max_false,))
-        else:
-            cur.execute("SELECT id1,id2 FROM pairs WHERE label=0")
-        false_pairs = [list(r) for r in cur.fetchall()]
+    cur.execute("SELECT id1,id2 FROM pairs WHERE label=1")
+    true_pairs = [list(r) for r in cur.fetchall()]
+    if max_false and max_false > 0:
+        cur.execute("SELECT id1,id2 FROM pairs WHERE label=0 LIMIT ?", (max_false,))
     else:
-        r = cur.execute(
-            "SELECT true_pair,false_pair FROM test_pairs WHERE id=0"
-        ).fetchone()
-        true_pairs = json.loads(r[0])
-        false_pairs = json.loads(r[1])
+        cur.execute("SELECT id1,id2 FROM pairs WHERE label=0")
+    false_pairs = [list(r) for r in cur.fetchall()]
     conn.close()
     return true_pairs, false_pairs
 

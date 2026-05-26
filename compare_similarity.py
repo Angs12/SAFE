@@ -5,7 +5,6 @@ import argparse, sqlite3, json, sys, os
 import torch
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from safetorch.safe_network import SAFE
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
