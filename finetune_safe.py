@@ -24,15 +24,19 @@ class PairDataset:
 
         cur.execute("SELECT name FROM sqlite_master WHERE name='pairs_train'")
         if not cur.fetchone():
-            print("Error: database has no train/val split. "
-                  "Recreate with: python create_dataset.py --train <binary_folder> <output_db>")
+            print(
+                "Error: database has no train/val split. "
+                "Recreate with: python create_dataset.py --train <binary_folder> <output_db>"
+            )
             sys.exit(1)
 
         if max_false:
             cur.execute("SELECT id1,id2 FROM pairs_train WHERE label=1")
             true_pairs = cur.fetchall()
-            cur.execute("SELECT id1,id2 FROM pairs_train WHERE label=0 ORDER BY RANDOM() LIMIT ?",
-                        (max_false,))
+            cur.execute(
+                "SELECT id1,id2 FROM pairs_train WHERE label=0 ORDER BY RANDOM() LIMIT ?",
+                (max_false,),
+            )
             false_pairs = cur.fetchall()
         else:
             cur.execute("SELECT id1,id2,label FROM pairs_train")
@@ -41,10 +45,11 @@ class PairDataset:
             false_pairs = [(a, b) for a, b, l in all_rows if l == 0]
             if len(false_pairs) > len(true_pairs):
                 random.Random(42).shuffle(false_pairs)
-                false_pairs = false_pairs[:len(true_pairs)]
+                false_pairs = false_pairs[: len(true_pairs)]
 
-        self.train_pairs = ([(a, b, 1) for a, b in true_pairs] +
-                            [(a, b, 0) for a, b in false_pairs])
+        self.train_pairs = [(a, b, 1) for a, b in true_pairs] + [
+            (a, b, 0) for a, b in false_pairs
+        ]
         random.Random(42).shuffle(self.train_pairs)
 
         cur.execute("SELECT id1,id2,label FROM pairs_val")
@@ -73,7 +78,11 @@ class PairDataset:
 
 
 def _unwrap_state_dict(model):
-    return model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+    return (
+        model.module.state_dict()
+        if isinstance(model, nn.DataParallel)
+        else model.state_dict()
+    )
 
 
 def embed_batch(normalizer, safe, seqs):
@@ -86,7 +95,9 @@ def embed_batch(normalizer, safe, seqs):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune SAFE model on paired function data")
+    parser = argparse.ArgumentParser(
+        description="Fine-tune SAFE model on paired function data"
+    )
     parser.add_argument("db_path")
     parser.add_argument("--model-dir", default="model")
     parser.add_argument("--output", default=None)
@@ -101,7 +112,9 @@ def main():
     safe, normalizer = SAFE.load(args.model_dir, DEVICE, train=True)
     frozen = sum(p.numel() for p in safe.parameters() if not p.requires_grad)
     trainable = sum(p.numel() for p in safe.parameters() if p.requires_grad)
-    print(f"  {frozen:,} frozen (embedding), {trainable:,} trainable (RNN+attention+dense)")
+    print(
+        f"  {frozen:,} frozen (embedding), {trainable:,} trainable (RNN+attention+dense)"
+    )
 
     n_gpu = torch.cuda.device_count()
     if n_gpu >= 2:
@@ -118,7 +131,7 @@ def main():
 
     print(f"[3/4] Fine-tuning ({args.epochs} epochs, batch_size={args.batch_size})...")
     optimizer = optim.Adam(
-        filter(lambda p: p.requires_grad, safe.parameters()), lr=1e-5
+        filter(lambda p: p.requires_grad, safe.parameters()), lr=1e-4
     )
     best_f1 = 0.0
 
@@ -155,7 +168,9 @@ def main():
 
             if n_batches % 25 == 0:
                 elapsed = time.time() - t0
-                remaining = (elapsed / n_batches) * ((n // args.batch_size + 1) - n_batches)
+                remaining = (elapsed / n_batches) * (
+                    (n // args.batch_size + 1) - n_batches
+                )
                 print(
                     f"  Ep {epoch+1}/{args.epochs}  batch {n_batches}/{n//args.batch_size+1}  loss={total_loss/n_batches:.6f}  {elapsed:.0f}s  est {remaining:.0f}s",
                     flush=True,

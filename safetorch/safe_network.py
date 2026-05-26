@@ -110,5 +110,7 @@ class SAFE(nn.Module):
             for name, param in safe.named_parameters():
                 if name.startswith("instructions_embeddings"):
                     param.requires_grad = False
+                else:
+                    param.requires_grad = True
             return safe.train(), normalizer
         return safe.eval(), normalizer
